@@ -1,0 +1,123 @@
+- name: Check custom service on both servers
+  hosts: rhel01, rhel02, rhel03
+  gather_facts: true
+  vars:
+    check_service: rsyslog.service
+
+  tasks:
+    - name: Gather service facts
+      service_facts:
+
+    - name: Ensure custom.service is running on all hosts
+      assert:
+        that:
+          - ansible_facts.services[check_service].state == 'running'
+        fail_msg: "{{ check_service }} is NOT running on {{ inventory_hostname }}"
+        success_msg: "{{ check_service }} is running on {{ inventory_hostname }}"
+      any_errors_fatal: true
+
+    - name: All good, start update
+      debug:
+        msg: "services running, update starting"
+      run_once: true
+ 
+- name: Rolling update and reboot with service check
+  hosts:
+    - rhel01
+    - rhel02
+    - rhel03
+  order: inventory
+  serial: 1
+  gather_facts: true
+  become: true
+  vars:
+    check_service: rsyslog.service
+    update_security_only: false      # true means only security updates
+    allow_reboot: true               # false means never reboot
+    min_free_space_mb: 1024          # required free space on root
+    reboot_timeout: 1800             # seconds to wait after reboot
+ 
+  pre_tasks:
+    - name: Show target and current kernel
+      ansible.builtin.debug:
+        msg: "Updating {{ inventory_hostname }}, kernel {{ ansible_kernel }}"
+      tags: [precheck]
+ 
+  tasks:
+    - name: Update all packages to latest
+      ansible.builtin.yum:
+        name: "*"
+        state: latest
+        update_cache: yes
+      when: not update_security_only
+      register: yum_update
+      tags: [patch]
+ 
+    - name: Apply only security updates
+      ansible.builtin.yum:
+        name: "*"
+        state: latest
+        security: yes
+        update_cache: yes
+      when: update_security_only
+      register: yum_update_security
+      tags: [patch]
+
+    - name: Check if reboot is required with needs-restarting
+      ansible.builtin.command: needs-restarting -r
+      register: needs_restarting
+      failed_when: needs_restarting.rc not in [0, 1]
+      changed_when: false
+      when: allow_reboot
+      tags: [reboot]
+
+    - name: Reboot server
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by Ansible patch playbook"
+        reboot_timeout: "{{ reboot_timeout }}"
+      when:
+        - allow_reboot
+        - >
+          (yum_update is defined and yum_update.changed)
+          or
+          (yum_update_security is defined and yum_update_security.changed)
+          or
+          (needs_restarting is defined and needs_restarting.rc == 1)
+      tags: [reboot] 
+
+    - name: Wait 10 seconds
+      ansible.builtin.pause:
+        seconds: 10
+ 
+    - name: Gather service facts
+      service_facts:
+
+    - name: Ensure custom.service is running on all hosts
+      assert:
+        that:
+          - ansible_facts.services[check_service].state == 'running'
+        fail_msg: "{{ check_service }} is NOT running on {{ inventory_hostname }}"
+        success_msg: "{{ check_service }} is running on {{ inventory_hostname }}"
+      any_errors_fatal: true
+ 
+    - name: Wait 10 seconds
+      ansible.builtin.pause:
+        seconds: 10
+
+    - name: update completed service running
+      debug:
+        msg: "update completed service running"
+      run_once: true
+
+    - name: Render HTML patch report on controller
+      delegate_to: localhost
+      run_once: true
+      vars:
+        ansible_play_hosts: "{{ ansible_play_hosts_all }}"
+      ansible.builtin.template:
+        src: templates/linux_patch_report.html.j2
+        dest: "/tmp/linux_patch_report_{{ lookup('pipe','date +%Y%m%d_%H%M%S') }}.html"
+        mode: "0644"
+
+
+ 
